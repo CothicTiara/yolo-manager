@@ -1,0 +1,385 @@
+# =============================================================================
+# YOLO 视觉识别模型管理平台 —— Docker 编排
+#
+# 用法（推荐走脚本，脚本会分阶段启动并在启动前引导你配置）：
+#   ./deploy.sh              Linux/macOS 交互式引导（首次推荐）
+#   ./deploy.sh cpu|gpu      跳过引导，按「全部组件走 docker 镜像」直接部署
+#   .\deploy.ps1             Windows 交互式引导
+#   powershell -File .\deploy.ps1 -Mode cpu -BuiltIn all
+#
+# 配置文件只有 .env（由脚本生成，已 gitignore）；不要在本文件里写口令。
+#
+# ------------------------------ profiles 一览 --------------------------------
+# COMPOSE_PROFILES 为逗号分隔列表，决定哪些服务真正启用：
+#   cpu / gpu            选择训练 worker（两者互斥，必选其一）
+#   builtin-mysql        启用容器内 MySQL，并顺带启用建表任务 db-init
+#   builtin-redis        启用容器内 Redis
+#   builtin-storage      启用容器内 RustFS（S3 兼容对象存储）
+#   auto-ddl             用外部 MySQL 时，仍然执行 schema.sql 建表
+#   auto-bucket          用外部对象存储时，仍然自动建桶
+# 例：内置 Redis + 外部 MySQL + 内置 RustFS 且库里已有表
+#   COMPOSE_PROFILES=cpu,builtin-redis,builtin-storage
+#
+# 因此 manager / train-api 不写跨层 depends_on（被 profile 关掉的服务出现在
+# depends_on 里，compose 会直接报 "depends on undefined service"）。启动顺序由
+# deploy.sh / deploy.ps1 保证：内置基础设施 → 建表/建桶任务 → 应用服务。
+# 手工执行 docker compose up -d 也能最终收敛（restart: unless-stopped 会重试），
+# 但首启可能报错重启几次，建议用脚本。
+#
+# CPU / GPU 的三处区别：
+#   1. COMPOSE_PROFILES 决定起 train-worker-cpu 还是 train-worker-gpu；
+#      nvidia 设备预约只写在 gpu 服务里，所以 CPU 机器不会碰到 nvidia 运行时
+#   2. TORCH_INDEX_URL_CPU / TORCH_INDEX_URL_GPU 决定镜像装 CPU 轮子还是 CUDA 轮子
+#   3. DEVICE / TRAIN_WORKERS / DEFAULT_BATCH_SIZE 传给 ultralytics（cpu 与 cuda）
+#
+# GPU 加速只作用于「训练」（Celery worker 容器持有显卡）；train-api 只做在线识别
+# 与数据集预处理，恒用 CPU 轮子。确需 GPU 推理时，把 train-worker-gpu 的
+# deploy.resources 片段复制到 train-api 并改用 gpu 镜像即可。
+# =============================================================================
+
+name: yolo-manager
+
+# ---------- 训练服务共用环境变量（FastAPI 与 Celery worker 完全一致）----------
+x-train-env: &train-env
+  # 数据库 / 缓存：内置时是服务名，外部时是引导里填写的地址
+  MYSQL_HOST: ${MYSQL_HOST:-mysql}
+  MYSQL_PORT: ${MYSQL_PORT:-3306}
+  MYSQL_USER: ${MYSQL_USER}
+  MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+  MYSQL_DATABASE: ${MYSQL_DATABASE}
+  REDIS_HOST: ${REDIS_HOST:-redis}
+  REDIS_PORT: ${REDIS_PORT:-6379}
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+  # Celery broker/result 用 db1/db2；指标库必须与 manager 的 spring.data.redis.database 相同
+  REDIS_DB_BROKER: ${REDIS_DB_BROKER:-1}
+  REDIS_DB_RESULT: ${REDIS_DB_RESULT:-2}
+  REDIS_METRICS_DB: ${REDIS_METRICS_DB:-5}
+  # 对象存储：这里必须是「应用容器能访问到」的地址；浏览器不需要访问它
+  STORAGE_TYPE: s3
+  S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+  S3_SECRET_KEY: ${S3_SECRET_KEY}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_USE_SSL: ${S3_USE_SSL:-false}
+  S3_BUCKET_DATASETS: ${S3_BUCKET_DATASETS:-yolo-datasets}
+  S3_BUCKET_MODELS: ${S3_BUCKET_MODELS:-yolo-models}
+  S3_BUCKET_TESTS: ${S3_BUCKET_TESTS:-yolo-tests}
+  # 容器内统一挂在 /model 下（named volume model-data），FastAPI 与 worker 必须共享
+  WORK_DIR: /model/work
+  YOLO_PROJECT_DIR: /model/yolo_projects
+  BASE_MODELS_DIR: /model/base_models
+  DEFAULT_EPOCHS: ${DEFAULT_EPOCHS:-100}
+  DEFAULT_BATCH_SIZE: ${DEFAULT_BATCH_SIZE:-16}
+  DEFAULT_IMGSZ: ${DEFAULT_IMGSZ:-640}
+  DATASET_PREP_WORKERS: ${DATASET_PREP_WORKERS:-16}
+  CALLBACK_TOKEN: ${CALLBACK_TOKEN:-}
+  TZ: Asia/Shanghai
+
+services:
+  # ============================================================ 内置基础设施 ==
+  # ---------------------------------------------------------------- MySQL 8.0
+  mysql:
+    profiles: ["builtin-mysql"]
+    image: ${MYSQL_IMAGE:-mysql:8.0}
+    container_name: yolo-mysql
+    # 显式使用 mysql_native_password：PyMySQL 在没有 cryptography 依赖时
+    # 无法完成 caching_sha2_password 的非加密全量认证（外部 MySQL 同样要注意）
+    command: >-
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_0900_ai_ci
+      --max-allowed-packet=268435456
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ADMIN_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: Asia/Shanghai
+    ports:
+      # 仅便于用客户端连进容器查看数据；应用容器一律走 mysql:3306
+      - "${MYSQL_EXPOSE_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
+
+  # -------------------------------------------------- 建表（幂等，跑完即退出）
+  # 内置 MySQL 自动执行；外部 MySQL 需要建表时把 auto-ddl 加进 COMPOSE_PROFILES
+  db-init:
+    profiles: ["builtin-mysql", "auto-ddl"]
+    image: ${MYSQL_IMAGE:-mysql:8.0}
+    container_name: yolo-db-init
+    environment:
+      MYSQL_HOST: ${MYSQL_HOST:-mysql}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_ADMIN_USER: ${MYSQL_ADMIN_USER:-root}
+      MYSQL_ADMIN_PASSWORD: ${MYSQL_ADMIN_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+    volumes:
+      - ./java-manger-subject/src/main/resources/db:/sql:ro
+    # schema.sql 为了能手工导入，库名写死为 yolo_manager；这里换成配置里的实际库名。
+    # --default-character-set=utf8mb4 必带：否则客户端按 latin1 提交，中文注释会真的存成 "?"
+    # 先轮询等 MySQL 可用：`docker compose up -d` 直接拉起时没有部署脚本的 --wait 分段，
+    # 不等就会因 2003 连不上而退出（建表任务 restart:no，失败后不会重试）。
+    entrypoint: >-
+      sh -c 'set -e;
+      i=0;
+      until mysqladmin ping -h "$$MYSQL_HOST" -P "$$MYSQL_PORT" -u"$$MYSQL_ADMIN_USER" -p"$$MYSQL_ADMIN_PASSWORD" --silent >/dev/null 2>&1; do
+        i=$$((i+1));
+        if [ $$i -ge 60 ]; then echo "[db-init] 等待 MySQL 就绪超时（180s）"; exit 1; fi;
+        echo "[db-init] 等待 MySQL 就绪 ($$i/60)..."; sleep 3;
+      done;
+      echo "[db-init] MySQL 已就绪";
+      for f in /sql/*.sql; do
+        echo "[db-init] 执行 $$f -> $$MYSQL_HOST:$$MYSQL_PORT 库 $$MYSQL_DATABASE";
+        sed "s|yolo_manager|$$MYSQL_DATABASE|g" "$$f" |
+          mysql -h "$$MYSQL_HOST" -P "$$MYSQL_PORT" -u"$$MYSQL_ADMIN_USER" -p"$$MYSQL_ADMIN_PASSWORD" --default-character-set=utf8mb4;
+      done;
+      echo "[db-init] 表结构就绪"'
+    restart: "no"
+
+  # ------------------------------------------------------------------- Redis
+  redis:
+    profiles: ["builtin-redis"]
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: yolo-redis
+    command: sh -c 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"'
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    ports:
+      - "${REDIS_EXPOSE_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # 官方镜像以 UID 10001 运行，named volume 首次创建属 root，需要先改属主
+  rustfs-init:
+    profiles: ["builtin-storage"]
+    image: ${ALPINE_IMAGE:-alpine:3.20}
+    container_name: yolo-rustfs-chown
+    user: "0"
+    volumes:
+      - rustfs-data-0:/data/rustfs0
+      - rustfs-data-1:/data/rustfs1
+      - rustfs-data-2:/data/rustfs2
+      - rustfs-data-3:/data/rustfs3
+      - rustfs-logs:/app/logs
+    command: sh -c 'chown -R 10001:10001 /data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3 /app/logs && echo "[rustfs-init] 数据卷属主已修正"'
+    restart: "no"
+
+  # ------------------------------------------------------ RustFS 对象存储
+  rustfs:
+    profiles: ["builtin-storage"]
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:latest}
+    container_name: yolo-rustfs
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      # 单机 4 目录伪拓扑（RustFS 官方 compose 简单模式）
+      RUSTFS_VOLUMES: /data/rustfs{0...3}
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS: "*"
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
+      RUSTFS_OBS_LOGGER_LEVEL: info
+      RUSTFS_OBS_LOG_DIRECTORY: /app/logs
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: ${RUSTFS_BYPASS_DISK_CHECK:-false}
+    ports:
+      # 容器之间走 http://rustfs:9000，这里的映射只给外部访问与上传大文件用
+      - "${RUSTFS_API_PORT:-9000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - rustfs-data-0:/data/rustfs0
+      - rustfs-data-1:/data/rustfs1
+      - rustfs-data-2:/data/rustfs2
+      - rustfs-data-3:/data/rustfs3
+      - rustfs-logs:/app/logs
+    healthcheck:
+      # 仅用于 docker compose ps 展示；镜像不一定自带 curl，所以不把其他服务
+      # 的启动条件挂在 service_healthy 上，而是由 bucket-init 自己重试直到 S3 可用
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 45s
+    restart: unless-stopped
+
+  # 建桶（幂等）：桶名来自 S3_BUCKET_*，已存在就跳过
+  # RustFS/MinIO 启动需要几秒，这里自己重试，不依赖健康检查通过。
+  # 补充：Python 侧 storage.py 也会在 head_bucket 404 时自动建桶，所以这一步是兜底。
+  bucket-init:
+    profiles: ["builtin-storage", "auto-bucket"]
+    image: ${MC_IMAGE:-minio/mc:latest}
+    container_name: yolo-bucket-init
+    environment:
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKETS: ${S3_BUCKET_DATASETS:-yolo-datasets} ${S3_BUCKET_MODELS:-yolo-models} ${S3_BUCKET_TESTS:-yolo-tests}
+    entrypoint: >-
+      sh -c 'set -e;
+      i=0;
+      until mc alias set yolo "$$S3_ENDPOINT" "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY" 2>/dev/null; do
+        i=$$((i+1));
+        if [ $$i -gt 60 ]; then echo "[bucket-init] 连不上 $$S3_ENDPOINT，检查地址可达性与密钥长度限制"; exit 1; fi;
+        echo "[bucket-init] 等待对象存储就绪 ($$i/60)"; sleep 5;
+      done;
+      for b in $$S3_BUCKETS; do
+        mc mb --ignore-existing "yolo/$$b" && echo "[bucket-init] 桶就绪 $$b";
+      done'
+    restart: "no"
+
+  # ============================================================== 应用组件 ====
+  # ------------------------------------------------------------- 管理后端
+  manager:
+    build:
+      context: ./java-manger-subject
+    image: yolo-manager/java:1.0.0
+    container_name: yolo-manager
+    environment:
+      # Spring Boot relaxed binding：下面的名字对应 application.yml 里的属性路径
+      SPRING_DATASOURCE_URL: jdbc:mysql://${MYSQL_HOST:-mysql}:${MYSQL_PORT:-3306}/${MYSQL_DATABASE}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD}
+      SPRING_DATA_REDIS_HOST: ${REDIS_HOST:-redis}
+      SPRING_DATA_REDIS_PORT: ${REDIS_PORT:-6379}
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SPRING_DATA_REDIS_DATABASE: ${REDIS_METRICS_DB:-5}
+      YOLO_STORAGE_TYPE: s3
+      YOLO_STORAGE_S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
+      YOLO_STORAGE_S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      YOLO_STORAGE_S3_SECRET_KEY: ${S3_SECRET_KEY}
+      YOLO_STORAGE_S3_REGION: ${S3_REGION:-us-east-1}
+      YOLO_STORAGE_S3_BUCKET_DATASETS: ${S3_BUCKET_DATASETS:-yolo-datasets}
+      YOLO_STORAGE_S3_BUCKET_MODELS: ${S3_BUCKET_MODELS:-yolo-models}
+      YOLO_STORAGE_S3_BUCKET_TESTS: ${S3_BUCKET_TESTS:-yolo-tests}
+      YOLO_STORAGE_S3_PATH_STYLE_ACCESS: ${S3_PATH_STYLE:-true}
+      # 训练服务地址；跨机部署训练时改成 http://<训练机IP>:<PY_PORT>
+      YOLO_TRAIN_SERVICE_BASE_URL: ${TRAIN_SERVICE_URL:-http://train-api:8000}
+      YOLO_TRAIN_SERVICE_MODE: ${TRAIN_DELIVERY_MODE:-http}
+      YOLO_CALLBACK_TOKEN: ${CALLBACK_TOKEN:-}
+      # Python 训练完成后回调本服务；跨机部署时改成 http://<本机IP>:<JAVA_PORT>
+      YOLO_CALLBACK_BASE_URL: ${CALLBACK_BASE_URL:-http://manager:8080}
+      JAVA_OPTS: ${JAVA_OPTS:--Xms512m -Xmx1024m}
+      TZ: Asia/Shanghai
+    ports:
+      - "${JAVA_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  # -------------------------------------------------- 训练/推理服务（FastAPI）
+  train-api:
+    build:
+      context: ./python-yolo-subject
+      args:
+        INSTALL_YOLO: ${INSTALL_YOLO:-true}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        # 本容器不跑训练，固定 CPU 轮子，体积小、与训练模式无关
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL_CPU:-https://download.pytorch.org/whl/cpu}
+    image: yolo-manager/train:cpu
+    container_name: yolo-train-api
+    environment:
+      <<: *train-env
+      DEVICE: cpu
+      TRAIN_WORKERS: ${TRAIN_WORKERS:-4}
+    ports:
+      - "${PY_PORT:-8000}:8000"
+    volumes:
+      - model-data:/model
+    shm_size: ${TRAIN_SHM_SIZE:-8g}
+    restart: unless-stopped
+
+  # ------------------------------------------- Celery worker：CPU 训练（profile: cpu）
+  # 构建配置与 train-api 完全一致（同镜像 yolo-manager/train:cpu），层缓存直接复用
+  train-worker-cpu:
+    profiles: ["cpu"]
+    build:
+      context: ./python-yolo-subject
+      args:
+        INSTALL_YOLO: ${INSTALL_YOLO:-true}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL_CPU:-https://download.pytorch.org/whl/cpu}
+    image: yolo-manager/train:cpu
+    container_name: yolo-train-worker-cpu
+    depends_on:
+      train-api:
+        condition: service_started
+    command: celery -A app.worker:celery_app worker --loglevel=info --concurrency=${WORKER_CONCURRENCY:-1}
+    environment:
+      <<: *train-env
+      DEVICE: cpu
+      TRAIN_WORKERS: ${TRAIN_WORKERS:-4}
+    volumes:
+      - model-data:/model
+    shm_size: ${TRAIN_SHM_SIZE:-8g}
+    restart: unless-stopped
+
+  # ------------------------------------------- Celery worker：GPU 加速（profile: gpu）
+  # 前置条件：宿主机已装 nvidia-container-toolkit，且 nvidia-smi 可用
+  train-worker-gpu:
+    profiles: ["gpu"]
+    build:
+      context: ./python-yolo-subject
+      args:
+        INSTALL_YOLO: ${INSTALL_YOLO:-true}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL_GPU:-https://download.pytorch.org/whl/cu124}
+    image: yolo-manager/train:gpu
+    container_name: yolo-train-worker-gpu
+    depends_on:
+      train-api:
+        condition: service_started
+    command: celery -A app.worker:celery_app worker --loglevel=info --concurrency=${WORKER_CONCURRENCY:-1}
+    environment:
+      <<: *train-env
+      DEVICE: cuda
+      TRAIN_WORKERS: ${TRAIN_WORKERS:-8}
+    volumes:
+      - model-data:/model
+    shm_size: ${TRAIN_SHM_SIZE:-8g}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-all}
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ 前端
+  web:
+    build:
+      context: ./vue-subject
+    image: yolo-manager/web:1.0.0
+    container_name: yolo-web
+    depends_on:
+      manager:
+        condition: service_started
+    ports:
+      - "${WEB_PORT:-80}:80"
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
+  model-data:
+  rustfs-data-0:
+  rustfs-data-1:
+  rustfs-data-2:
+  rustfs-data-3:
+  rustfs-logs:

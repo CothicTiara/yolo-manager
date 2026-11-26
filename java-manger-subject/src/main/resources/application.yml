@@ -1,0 +1,82 @@
+server:
+  port: 8080
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+  tomcat:
+    # 大文件导入：避免请求体过大时被提前吞掉/连接超时
+    max-swallow-size: -1
+    connection-timeout: 900000
+
+spring:
+  application:
+    name: yolo-manager
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://172.16.5.121:3306/yolo_manager?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: root
+    password: Zjtl@123
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      password: 
+      database: 5
+      timeout: 5000ms
+  servlet:
+    multipart:
+      # 支持大型数据集压缩包导入（如 6000 张图 / 2.5GB）；0 表示直接落盘临时文件，不占用堆内存
+      max-file-size: 5120MB
+      max-request-size: 5120MB
+      file-size-threshold: 0
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# ===== 业务配置 =====
+yolo:
+  # 文件存储: s3（连接 RustFS/MinIO 等 S3 兼容对象存储） 或 local（本地磁盘，开发调试用）
+  storage:
+    type: s3
+    local-root: ${STORAGE_LOCAL_ROOT:./data/storage}
+    # 对外访问前缀（本地模式）
+    public-base-url: ${STORAGE_PUBLIC_BASE_URL:http://localhost:8080/storage}
+    # S3 / RustFS 配置
+    s3:
+      endpoint: http://172.16.5.119:19190
+      access-key: rustfsadmin
+      secret-key: rustfsadmin
+      region: us-east-1
+      bucket-datasets: yolo-datasets
+      bucket-models: yolo-models
+      bucket-tests: yolo-tests
+      path-style-access: true
+  # FastAPI 训练/推理服务地址
+  train-service:
+    base-url: http://localhost:8000
+    # 训练任务入队方式: http(调用 FastAPI 接口) 或 redis(写入 Redis 队列)
+    mode: http
+    redis-queue: train:queue
+  # 任务回调鉴权（简单 token，可留空）
+  callback:
+    token: 
+    # Java 后端对外可访问的基础地址（供 Python 训练服务回调）；跨机部署在 prod profile 覆写
+    base-url: ${YOLO_CALLBACK_BASE_URL:http://localhost:8080}
+
+logging:
+  level:
+    com.zyl.yolo: info
+    com.amazonaws: warn

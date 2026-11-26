@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# 含真实口令，绝不能进镜像；容器内一律用环境变量注入配置
+.env
+work/
+logs/
+*.log
+Dockerfile
+.dockerignore
+README.md

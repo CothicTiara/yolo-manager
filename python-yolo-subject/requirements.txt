@@ -1,0 +1,21 @@
+# Python 3.10+
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+# FastAPI 的 Form/UploadFile（上传、推理、导入接口）依赖，缺了启动即抱错
+python-multipart>=0.0.9,<0.1
+celery==5.4.0
+kombu>=5.3.4,<5.4
+redis>=4.5,<6
+boto3==1.35.55
+pydantic==2.10.2
+pydantic-settings==2.6.1
+PyMySQL==1.1.1
+SQLAlchemy==2.0.36
+# YOLO 训练依赖（体积大，建议在 GPU 服务器单独安装；本地语法检查无需）
+# ultralytics==8.3.35
+# torch>=2.0.0
+# torchvision>=0.15.0
+opencv-python-headless==4.10.0.84
+Pillow==11.0.0
+requests==2.32.3
+httpx==0.28.1

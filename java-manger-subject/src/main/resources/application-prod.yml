@@ -1,0 +1,21 @@
+# ===== 生产环境 profile（172.16.5.120 Java+前端 / 172.16.5.124 Python / 172.16.5.119 RustFS）=====
+# 仅列出与默认 application.yml 的差异项，其余继承基础配置（MySQL 172.16.5.121、Redis db5、S3 172.16.5.119 等）。
+server:
+  port: 12391
+
+spring:
+  data:
+    redis:
+      # Redis 复用 .120 现网实例（已对局域网开放、无密码）；Java 与 Python 均连此实例，指标库需一致
+      host: 172.16.5.120
+      port: 6379
+      database: 5
+
+yolo:
+  # Python FastAPI 训练/推理服务（部署在 .124，端口 12390）
+  train-service:
+    base-url: http://172.16.5.124:12390
+    mode: http
+  # Java 后端对外回调基础地址（供 .124 Python 训练完成后回调 .120 Java）
+  callback:
+    base-url: http://172.16.5.120:12391

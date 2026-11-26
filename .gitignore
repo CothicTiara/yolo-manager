@@ -22,3 +22,35 @@
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*
+
+### Java 构建产物 ###
+target/
+!**/src/main/**/target/
+!**/src/test/**/target/
+!.mvn/wrapper/maven-wrapper.jar
+data/
+
+### Python ###
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+work/
+
+### 前端 ###
+node_modules/
+dist/
+*.local
+npm-debug.log*
+
+### 本地环境变量（deploy.sh / deploy.ps1 生成的 .env 不要提交）###
+.env
+.env.bak
+
+### 日志目录 ###
+logs/
+
+### OS ###
+.DS_Store
+Thumbs.db
